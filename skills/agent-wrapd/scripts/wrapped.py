@@ -85,8 +85,9 @@ TYPICAL = {
     "sub_per": 1.4,
     "tools_per": 12.5,
     # Rough guesses, not in that sample: rage prompts and failed tool calls (%),
-    # median minutes an agent works between two of your messages, and sessions
-    # running at once while you work.
+    # median minutes an agent works between two of your messages, sessions
+    # running at once while you work, and quick-fix asks per hundred messages.
+    "quick": 1.0,
     "rage": 2.0,
     "fail": 8.0,
     "leash": 1.5,
@@ -166,15 +167,42 @@ CALL_ID = re.compile(r'"call_id":"([^"]+)"')
 TIMESTAMP = re.compile(r'"timestamp":"([^"]+)"')
 MIN_TOOL_CALLS = 50  # least reliable tool needs at least this many calls
 
+# What you ask for, in English, Spanish, Portuguese, French and German. Words only
+# nudge the quick-fix factor; what the agent did to a failing check decides it.
 QUICK_FIX = re.compile(
     r"\b(quick(est)? (fix|hack|patch)|smallest (possible )?(change|fix|diff)|minimal (change|fix|diff|patch)|"
-    r"simplest (fix|change)|just make (it|them|the tests?) (work|pass)|band-?aid|workaround|monkey-?patch|"
-    r"skip (the|this|that) test|arreglo r[aá]pido|parche|cambio m[ií]nimo|lo m[aá]s r[aá]pido)\b",
+    r"simplest (fix|change)|just make (it|them|the tests?|the build|ci) (work|pass|green)|band-?aid|workaround|"
+    r"monkey-?patch|hack around|skip (the|this|that|those|these) tests?|(just )?(silence|suppress|mute) (it|the|that|this)|"
+    r"comment (it|that|this|them) out|hard-?code (it|that|this)|ignore (the|that|this) (error|warning|lint)|"
+    r"arreglo r[aá]pido|parche|cambio m[ií]nimo|lo m[aá]s r[aá]pido|soluci[oó]n (temporal|r[aá]pida)|"
+    r"com[eé]ntal[oa]s?|ign[oó]ra(lo|la)? (el|ese|este) (error|warning)|hardcod[eé]a(lo)?|salta(te)? (el|ese|los) tests?|"
+    r"gambiarra|solu[cç][aã]o r[aá]pida|rustine|contournement|solution rapide|notl[oö]sung|schnelle l[oö]sung)\b",
     re.IGNORECASE,
 )
 ROOT_CAUSE = re.compile(
-    r"\b(root cause|properly|the right way|proper fix|underlying (issue|problem|cause)|fix it for real|"
-    r"causa ra[ií]z|de ra[ií]z|bien hecho|como debe ser|la forma correcta)\b",
+    r"\b(root cause|(fix|do|handle|solve|implement)\w* (it |this |that |them )?properly|the right way|proper fix|real fix|permanent fix|underlying (issue|problem|cause)|"
+    r"fix it for real|figure out why|find out why|dig into|investigate|what'?s causing|what causes|why (is|does|did|are|do) (it|this|that|the)|"
+    r"don'?t hack|no hacks|"
+    r"causa ra[ií]z|de ra[ií]z|bien hecho|como debe ser|la forma correcta|de fondo|averigua|investiga|"
+    r"qu[eé] (lo )?(est[aá] )?causa(ndo)?|por qu[eé] (pasa|falla|truena|sale|se rompe)|arr[eé]glalo bien|"
+    r"causa raiz|corrigir direito|por que (est[aá] )?falha|cause racine|pourquoi (ça|ca) (plante|casse|[eé]choue)|"
+    r"ursache|warum (schl[aä]gt|bricht|passiert))\b",
+    re.IGNORECASE,
+)
+# What the agent did, in any language: added a skip or silenced a check ...
+SUPPRESS = re.compile(
+    r"@ts-(ignore|expect-error|nocheck)|eslint-disable|biome-ignore|#\s*type:\s*ignore|#\s*noqa|#\s*pyright:\s*ignore|"
+    r"#\s*pragma:\s*no cover|//\s*nolint|#\[allow\(|@SuppressWarnings|\bas any\b|"
+    r"\.skip\(|\bx(it|describe|test)\(|@pytest\.mark\.(skip|xfail)|pytest\.skip\(|unittest\.skip|\bt\.Skip\(|#\[ignore\]|"
+    r"except(\s+\w+(\s+as\s+\w+)?)?\s*:\s*pass\b|catch\s*(\(\s*\w*\s*\))?\s*\{\s*\}"
+)
+BYPASS = re.compile(
+    r"--no-verify|--deselect|-k\s+['\"]?not\b|--passWithNoTests|\bSKIP=\S|\bHUSKY=0|--no-check\b"
+)
+# ... or went looking for where the bug came from.
+DIG = re.compile(r"\bgit\s+(blame|bisect|log\s+(-\S+\s+)*-(p|L|S|G))\b")
+TEST_FILE = re.compile(
+    r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.(py|go)$|\.(test|spec)\.[cm]?[jt]sx?$",
     re.IGNORECASE,
 )
 CHECK_CMD = re.compile(
@@ -459,10 +487,11 @@ def text_of(content) -> str:
 
 
 def patch_stats(text: str):
+    """Lines added and removed, the files touched, and the added and removed code."""
     if "*** Begin Patch" not in text:
-        return 0, 0, []
+        return 0, 0, [], ("", "")
     text = text.replace("\\n", "\n")
-    added = removed = 0
+    plus, minus = [], []
     files = []
     for ln in text.split("\n"):
         if ln.startswith("*** "):
@@ -470,10 +499,10 @@ def patch_stats(text: str):
             if m:
                 files.append(m.group(1).strip().strip('"'))
         elif ln.startswith("+") and not ln.startswith("+++"):
-            added += 1
+            plus.append(ln[1:])
         elif ln.startswith("-") and not ln.startswith("---"):
-            removed += 1
-    return added, removed, files
+            minus.append(ln[1:])
+    return len(plus), len(minus), files, ("\n".join(plus), "\n".join(minus))
 
 
 def is_rage(text: str) -> bool:
@@ -490,8 +519,8 @@ def fmt_minutes(m: float) -> str:
     return f"{m // 60}h {m % 60}m" if m >= 90 else f"{m} min"
 
 
-def plural(n: int, word: str) -> str:
-    return f"{n:,} {word}{'' if n == 1 else 's'}"
+def plural(n: int, word: str, many: str = "") -> str:
+    return f"{n:,} {word if n == 1 else many or word + 's'}"
 
 
 def nlines(s) -> int:
@@ -515,10 +544,16 @@ class Session:
         "cwd",
         "edits",
         "end",
+        "fix_edits",
+        "fix_patch",
+        "fix_test",
+        "fixes",
         "interrupts",
         "is_sub",
         "last",
         "parent",
+        "recheck",
+        "red",
         "rejects",
         "repo",
         "run_mark",
@@ -555,6 +590,23 @@ class Session:
         self.runs: list[float] = []  # agent-only stretches between human messages
         self.edits = 0
         self.checks = 0
+        # A fix: a check fails, the agent edits, the check runs again.
+        self.fixes = Counter()  # clean, tested, patched, bypass, dig
+        self.red = False
+        self.fix_edits = 0
+        self.fix_patch = self.fix_test = False
+        self.recheck = None  # (call id, bypassed) until we know it passed
+
+    def settle(self):
+        if not self.recheck:
+            return
+        patched = self.fix_patch or self.recheck[1]
+        self.fixes["patched" if patched else "clean"] += 1
+        if self.fix_test and not patched:
+            self.fixes["tested"] += 1
+        self.recheck = None
+        self.red, self.fix_edits = False, 0
+        self.fix_patch = self.fix_test = False
 
     def end_run(self):
         if self.cur_run:
@@ -597,6 +649,7 @@ class Collector:
         self.seen_msgs: set[str] = set()
         self.tool_ids: dict[str, str] = {}
         self.tool_fail = Counter()
+        self.check_calls: dict[str, Session] = {}
         self.first_seen: dict[str, datetime] = {}
         self.layers = Counter()
         self.check_runs = 0
@@ -645,6 +698,7 @@ class Collector:
             self.p_models[proj][model] += n
 
     def add_turn(self, s: Session, ts, text):
+        s.settle()
         s.turns.append(text)
         s.end_run()
         s.run_mark, s.run_tools = s.active, 0
@@ -662,22 +716,46 @@ class Collector:
 
     def tool_failed(self, call_id):
         self.tool_fail[self.tool_ids.get(call_id, "?")] += 1
+        s = self.check_calls.get(call_id)
+        if s:
+            if s.recheck and s.recheck[0] == call_id:
+                s.recheck = None  # still failing, so the same fix goes on
+            s.red = True
 
-    def add_tool(self, s: Session, name, lines=(0, 0), files=(), cmd=""):
+    def add_tool(
+        self, s: Session, name, lines=(0, 0), files=(), cmd="", cid=None, code=("", "")
+    ):
+        if s.recheck and s.recheck[0] != cid:
+            s.settle()  # no failure came back for the re-check
         label = tool_label(name)
         s.tools += 1
         s.run_tools += 1
         self.tools[label] += 1
         if label in EDIT_TOOLS:
             s.edits += 1
+            if s.red:
+                s.fix_edits += 1
+                s.fix_patch |= len(SUPPRESS.findall(code[0])) > len(
+                    SUPPRESS.findall(code[1])
+                )
+                s.fix_test |= any(f and TEST_FILE.search(f) for f in files)
         shell = label == "Shell" and cmd
+        bypass = bool(shell and BYPASS.search(cmd))
+        if shell and DIG.search(cmd):
+            s.fixes["dig"] += 1
         if shell and CHECK_CMD.search(cmd):
             s.checks += 1
             self.check_runs += 1
+            if cid:
+                self.check_calls[cid] = s
+                if s.red and s.fix_edits:
+                    s.recheck, bypass = (cid, bypass), False
         elif (shell and RUNTIME_CMD.search(cmd)) or RUNTIME_TOOL.search(name):
             s.checks += 1
             self.check_runs += 1
             self.layers["verification"] += 1
+        if bypass:
+            s.fixes["bypass"] += 1
         if name in SUBAGENT_TOOLS:
             s.subagents += 1
         proj = self.project(s)
@@ -819,23 +897,27 @@ class Collector:
         name = c.get("name") or "?"
         self.tool_ids[c.get("id")] = tool_label(name)
         inp = c.get("input") or {}
-        lines, files = (0, 0), ()
-        if name == "Edit":
-            lines = (nlines(inp.get("new_string")), nlines(inp.get("old_string")))
-            files = (inp.get("file_path"),)
-        elif name == "MultiEdit":
-            eds = inp.get("edits") or []
+        lines, files, code = (0, 0), (), ("", "")
+        if name in ("Edit", "MultiEdit"):
+            eds = inp.get("edits") or [inp]
+            code = tuple(
+                "\n".join(str(e.get(k) or "") for e in eds)
+                for k in ("new_string", "old_string")
+            )
             lines = (
                 sum(nlines(e.get("new_string")) for e in eds),
                 sum(nlines(e.get("old_string")) for e in eds),
             )
             files = (inp.get("file_path"),)
         elif name == "Write":
+            code = (str(inp.get("content") or ""), "")
             lines = (nlines(inp.get("content")), 0)
             files = (inp.get("file_path"),)
         elif name == "Skill" and inp.get("skill"):
             self.skills["/" + str(inp["skill"]).lstrip("/")] += 1
-        self.add_tool(s, name, lines, files, str(inp.get("command") or ""))
+        self.add_tool(
+            s, name, lines, files, str(inp.get("command") or ""), c.get("id"), code
+        )
 
     # ---- Codex ----
     def codex(self, root: Path):
@@ -952,7 +1034,7 @@ class Collector:
                     names = inner or [p.get("name") or p.get("type")]
                     if p.get("call_id"):
                         self.tool_ids[p["call_id"]] = tool_label(names[0])
-                    added, removed, files = patch_stats(blob)
+                    added, removed, files, code = patch_stats(blob)
                     for i, n in enumerate(names):
                         self.add_tool(
                             s,
@@ -960,6 +1042,8 @@ class Collector:
                             (added, removed) if i == 0 else (0, 0),
                             files if i == 0 else (),
                             blob,
+                            p.get("call_id"),
+                            code if i == 0 else ("", ""),
                         )
                     self.agent_busy(s, ts)
                 elif kind == "user" and not s.is_sub:
@@ -1022,6 +1106,8 @@ class Collector:
 
     # ---- summary ----
     def build(self) -> dict:
+        for s in self.sessions.values():
+            s.settle()
         subs = [s for s in self.sessions.values() if s.is_sub]
         children = Counter()
         for s in subs:
@@ -1031,6 +1117,7 @@ class Collector:
                 parent.tools += s.tools
                 parent.edits += s.edits
                 parent.checks += s.checks
+                parent.fixes += s.fixes
                 children[parent.sid] += 1
         for s in self.sessions.values():
             s.subagents = max(s.subagents, children[s.sid])
@@ -1317,6 +1404,12 @@ class Collector:
         turns = [t for s in driven for t in s.turns]
         quick = sum(bool(QUICK_FIX.search(t)) for t in turns)
         root = sum(bool(ROOT_CAUSE.search(t)) for t in turns)
+        fx = sum((s.fixes for s in driven), Counter())
+        blocked = fx["clean"] + fx["patched"] + fx["bypass"]  # a check got in the way
+        # No fixes seen (Cursor keeps no edits): what you asked for, against what a
+        # typical user asks in as many messages.
+        expected = len(turns) * TYPICAL["quick"] / 100
+        asked = lean(min(4.0, (root + expected + 1) / (quick + 1)))
 
         edited = [s for s in driven if s.edits]
         checked = sum(1 for s in edited if s.checks)
@@ -1339,7 +1432,7 @@ class Collector:
 
         score = {
             "babysit": lean(rel("leash", leash) / max(0.25, hover)),
-            "quick": (root + 1) / (quick + root + 2),
+            "quick": fx["clean"] / blocked if blocked else asked,
             "verify": checked / len(edited) if edited else 0.5,
             "trust": (static + 1) / (static + prose + review + 2),
             "line": lean(statistics.mean([rel("parallel", busy), rel("sub_per")])),
@@ -1356,13 +1449,28 @@ class Collector:
                 ],
             },
             "quick": {
-                "hero": f"{quick:,}",
-                "label": "messages asking for a quick fix, the smallest change, or a workaround",
+                **(
+                    {
+                        "hero": f"{round(100 * fx['clean'] / blocked)}%",
+                        "label": "of the times a check got in the way, your agents fixed it instead of going around it",
+                    }
+                    if blocked
+                    else {
+                        "hero": f"{quick:,}",
+                        "label": "messages asking for a quick fix, the smallest change, or a workaround",
+                    }
+                ),
                 "count": quick,
                 "root": root,
+                "fixes": {
+                    k: fx[k] for k in ("clean", "tested", "patched", "bypass", "dig")
+                },
                 "evidence": [
-                    f"{plural(root, 'message')} asked for the root cause or the proper fix.",
-                    f"Quick-fix asks were {round(100 * quick / len(turns), 1) if turns else 0}% of everything you typed.",
+                    f"{plural(fx['patched'], 'fix', 'fixes')} skipped a test or silenced an error to get a check passing.",
+                    f"{plural(fx['tested'], 'fix', 'fixes')} also changed a test.",
+                    f"{plural(fx['bypass'], 'command')} went around a check, like --no-verify or a deselected test.",
+                    f"{plural(fx['dig'], 'time')} your agents dug through git history (blame, bisect, log -p).",
+                    f"{plural(quick, 'message')} asked for a quick fix or a workaround; {plural(root, 'message')} asked why or for the proper fix.",
                 ],
             },
             "verify": {

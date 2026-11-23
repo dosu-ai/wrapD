@@ -630,6 +630,282 @@ with tempfile.TemporaryDirectory() as tmp:
     check("no four-letter type", "type" in p or "wrapd" in plant, False)
 
 
+# Quick fixes: what the agent did to a failing check decides it, in any language.
+def fixes_fixture(root):
+    n = iter(range(10_000))
+
+    def row(kind, content, mid=None):
+        i = next(n)
+        r = {
+            "cwd": "/nowhere/mill",
+            "sessionId": "q1",
+            "type": kind,
+            "timestamp": f"2026-07-01T10:{i // 60:02d}:{i % 60:02d}Z",
+            "message": {"role": kind, "content": content},
+        }
+        if mid:
+            r["message"].update(
+                id=mid, model="claude-opus-5-5", usage={"input_tokens": 5}
+            )
+        return r
+
+    def call(cid, name, **inp):
+        return row(
+            "assistant",
+            [{"type": "tool_use", "id": cid, "name": name, "input": inp}],
+            "m" + cid,
+        )
+
+    def result(cid, failed):
+        return row(
+            "user",
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": cid,
+                    "content": "Exit code 1\nFAILED" if failed else "ok",
+                    "is_error": failed,
+                }
+            ],
+        )
+
+    def edit(cid, path, old, new):
+        return call(
+            cid,
+            "Edit",
+            file_path="/nowhere/mill/" + path,
+            old_string=old,
+            new_string=new,
+        )
+
+    jl(
+        root / "-nowhere-mill" / "q1.jsonl",
+        [
+            row("user", "the login test started failing, take a look"),
+            # red -> code and test edits -> green: a clean fix that left a test
+            call("c1", "Bash", command="pytest tests/test_login.py"),
+            result("c1", True),
+            edit("e1", "src/login.py", "a", "b"),
+            edit("e2", "tests/test_login.py", "a", "b"),
+            call("c2", "Bash", command="pytest tests/test_login.py"),
+            result("c2", False),
+            call("g1", "Bash", command="git blame src/login.py"),
+            result("g1", False),
+            # red -> edit -> still red -> silenced -> green: one patched fix
+            call("c3", "Bash", command="ruff check ."),
+            result("c3", True),
+            edit("e3", "src/a.py", "y", "z"),
+            call("c4", "Bash", command="ruff check ."),
+            result("c4", True),
+            edit("e4", "src/a.py", "x = 1", "x = 1  # noqa: F841"),
+            call("c5", "Bash", command="ruff check ."),
+            result("c5", False),
+            # red -> edit that keeps an existing suppression -> green: clean
+            call("c6", "Bash", command="pnpm lint"),
+            result("c6", True),
+            edit(
+                "e5",
+                "src/b.ts",
+                "a = b // eslint-disable-line",
+                "a = c // eslint-disable-line",
+            ),
+            call("c7", "Bash", command="pnpm lint"),
+            result("c7", False),
+            # a green check with no failure before it is not a fix
+            call("c8", "Bash", command="pnpm lint"),
+            result("c8", False),
+            call("b1", "Bash", command="git commit --no-verify -m wip"),
+            result("b1", False),
+            row("user", "gracias"),
+        ],
+    )
+
+
+def codex_fix_fixture(root):
+    def item(sec, payload, kind="response_item"):
+        return {
+            "timestamp": f"2026-07-02T09:00:{sec:02d}Z",
+            "type": kind,
+            "payload": payload,
+        }
+
+    def user(sec, text):
+        return item(
+            sec,
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        )
+
+    patch = (
+        "*** Begin Patch\n*** Update File: web/cart.test.ts\n"
+        "-  it('totals', () => {\n+  it.skip('totals', () => {\n*** End Patch"
+    )
+    jl(
+        root / "sessions" / "2026" / "07" / "02" / "rollout-fix.jsonl",
+        [
+            item(0, {"id": "k", "cwd": "/nowhere/shop"}, "session_meta"),
+            user(1, "por qué falla el build?"),
+            item(
+                2,
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "k1",
+                    "arguments": '{"cmd":"pnpm test"}',
+                },
+            ),
+            item(
+                3,
+                {
+                    "type": "function_call_output",
+                    "call_id": "k1",
+                    "output": "Process exited with code 1",
+                },
+            ),
+            item(
+                4,
+                {
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "call_id": "k2",
+                    "input": patch,
+                },
+            ),
+            item(
+                5,
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "k3",
+                    "arguments": '{"cmd":"pnpm test"}',
+                },
+            ),
+            item(
+                6,
+                {
+                    "type": "function_call_output",
+                    "call_id": "k3",
+                    "output": "Process exited with code 0",
+                },
+            ),
+            user(7, "listo, súbelo"),
+        ],
+    )
+
+
+def chatty_fixture(root, sid, lines):
+    jl(
+        root / "-nowhere-chat" / f"{sid}.jsonl",
+        [
+            {
+                "cwd": "/nowhere/chat",
+                "sessionId": sid,
+                "type": "user",
+                "timestamp": f"2026-08-01T{i // 60:02d}:{i % 60:02d}:00Z",
+                "message": {"role": "user", "content": text},
+            }
+            for i, text in enumerate(lines)
+        ],
+    )
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    fixes_fixture(tmp / "claude")
+    codex_fix_fixture(tmp / "codex")
+    mill = {
+        x["key"]: x
+        for x in wrapped.collect(tmp / "claude", tmp / "codex", 2026)["factors"]
+    }
+    q = mill["quick"]
+    check(
+        "fixes read from tool calls",
+        q["fixes"],
+        {"clean": 2, "tested": 1, "patched": 2, "bypass": 1, "dig": 1},
+    )
+    check("hero is the share of real fixes", q["hero"], "40%")
+    check("the meter shows the same share", q["score"], 40)
+    check("a Spanish why counts as digging", q["root"], 1)
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    plain = [f"add the export button to page {i}" for i in range(150)]
+    chatty_fixture(tmp / "claude", "p1", plain)
+    calm = {
+        x["key"]: x
+        for x in wrapped.collect(tmp / "claude", tmp / "nope", 2026)["factors"]
+    }["quick"]
+    check("never asking for a shortcut leans root cause", calm["score"] >= 70, True)
+    check("no fixes falls back to counting asks", calm["hero"], "0")
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    hasty = ["just make the tests pass", "quick fix please", "workaround is fine"] * 10
+    chatty_fixture(tmp / "claude", "h1", hasty + plain[:70])
+    rushed = {
+        x["key"]: x
+        for x in wrapped.collect(tmp / "claude", tmp / "nope", 2026)["factors"]
+    }["quick"]
+    check("asking for shortcuts leans band-aid", rushed["score"] < 30, True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    check(
+        "no messages and no fixes sits in the middle",
+        {x["key"]: x for x in wrapped.collect(Path(tmp), Path(tmp), 2026)["factors"]}[
+            "quick"
+        ]["score"],
+        50,
+    )
+
+for text in [
+    "just make the build green",
+    "comment it out for now",
+    "ignora el error y sigue",
+    "solución temporal mientras",
+    "faz uma gambiarra",
+    "une rustine suffit",
+    "eine Notlösung reicht",
+]:
+    check(f"shortcut ask: {text}", bool(wrapped.QUICK_FIX.search(text)), True)
+for text in [
+    "figure out why the cache misses",
+    "what's causing the flake?",
+    "investiga qué lo está causando",
+    "arréglalo bien",
+    "qual a causa raiz?",
+    "trouve la cause racine",
+    "finde die Ursache",
+]:
+    check(f"root ask: {text}", bool(wrapped.ROOT_CAUSE.search(text)), True)
+for text in ["it doesn't render properly", "dale un contorno al botón"]:
+    check(
+        f"neither: {text}",
+        bool(wrapped.QUICK_FIX.search(text) or wrapped.ROOT_CAUSE.search(text)),
+        False,
+    )
+check(
+    "fix it properly", bool(wrapped.ROOT_CAUSE.search("please fix this properly")), True
+)
+for text in [
+    "add a parchment background",
+    "comment out the debug logs in the docs page",
+]:
+    check(f"not a shortcut: {text}", bool(wrapped.QUICK_FIX.search(text)), False)
+for code in [
+    "// @ts-expect-error",
+    "x = f()  # type: ignore[arg]",
+    "describe.skip('cart'",
+    "except ValueError:\n    pass",
+    "catch (e) {}",
+]:
+    check(f"suppression: {code!r}", bool(wrapped.SUPPRESS.search(code)), True)
+for code in ["const skip = 1", "except ValueError:\n    raise"]:
+    check(f"not a suppression: {code!r}", bool(wrapped.SUPPRESS.search(code)), False)
+
+
 def scored(**kw):
     return [
         {"key": k, "score": kw.get(k, 50)}
