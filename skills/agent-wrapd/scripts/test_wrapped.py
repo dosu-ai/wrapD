@@ -996,6 +996,8 @@ check(
     sorted(set(re.findall(r"https?://(?!www\.w3\.org/2000/svg)[^\s\"'<>;]+", page))),
     [
         "https://dosu.dev",
+        "https://dosu.dev/?utm_source=wrapd&utm_medium=wrap&utm_content=card",
+        "https://dosu.dev/?utm_source=wrapd&utm_medium=wrap&utm_content=pitch",
         "https://dosu.dev/fonts/PPMondwest-Regular.woff2",
         "https://dosu.dev/fonts/mona-sans-latin.woff2",
         "https://www.linkedin.com/sharing/share-offsite/?url=",
